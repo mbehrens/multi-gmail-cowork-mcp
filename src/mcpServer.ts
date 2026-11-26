@@ -1,7 +1,16 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { getAccountStore } from './accountStore.js';
-import { createDraft, GmailApiError, getMessage, searchMessages, sendMessage } from './gmail.js';
+import {
+  applyReplyContext,
+  createDraft,
+  GmailApiError,
+  getMessage,
+  getReplyContext,
+  searchMessages,
+  sendMessage,
+  type ComposeMessageInput,
+} from './gmail.js';
 import { isReauthRequiredError } from './googleOAuth.js';
 import { log } from './logger.js';
 import { ALIAS_PATTERN, loadConfig } from './config.js';
@@ -52,6 +61,17 @@ const recipientSchema = z
   .describe('One or more comma-separated recipient email addresses.');
 const subjectSchema = z.string().max(998).default('').describe('Message subject.');
 const bodySchema = z.string().min(1).max(100_000).describe('Plain-text message body.');
+
+async function composeInput(
+  record: AccountRecord,
+  input: ComposeMessageInput,
+  replyToMessageId: string | undefined,
+  replyAll: boolean,
+): Promise<ComposeMessageInput> {
+  if (!replyToMessageId) return input;
+  const ctx = await getReplyContext(record.refreshToken, replyToMessageId);
+  return applyReplyContext(input, ctx, record.email, replyAll);
+}
 
 function writeFailure(operation: string, account: AccountRecord, err: unknown) {
   if (err instanceof GmailApiError && isReauthRequiredError(err)) {
@@ -204,14 +224,26 @@ export function createMcpServer(): McpServer {
           bcc: recipientSchema.optional(),
           subject: subjectSchema,
           body: bodySchema,
+          reply_to_message_id: messageIdSchema
+            .optional()
+            .describe(
+              'Optional Gmail message ID (from search/get_email in THIS account) to reply to. The result is placed in ' +
+                'that thread with In-Reply-To/References set. If to is omitted it defaults to the original sender ' +
+                '(Reply-To/From); if subject is omitted it becomes "Re: <original subject>".',
+            ),
+          reply_all: z
+            .boolean()
+            .default(false)
+            .describe('With reply_to_message_id and no to/cc given: also cc the original To/Cc recipients.'),
         },
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
       },
-      async ({ account, to, cc, bcc, subject, body }) => {
+      async ({ account, to, cc, bcc, subject, body, reply_to_message_id, reply_all }) => {
         const record = await resolveAccount(account);
-        log.info('tool_create_draft', { account });
+        log.info('tool_create_draft', { account, reply: Boolean(reply_to_message_id) });
         try {
-          const draft = await createDraft(record.refreshToken, { to, cc, bcc, subject, body });
+          const input = await composeInput(record, { to, cc, bcc, subject, body }, reply_to_message_id, reply_all);
+          const draft = await createDraft(record.refreshToken, input);
           return jsonResult({
             account: record.alias,
             email: record.email,
@@ -234,19 +266,33 @@ export function createMcpServer(): McpServer {
           'account as the From identity. The account alias is required and is never inferred or substituted.',
         inputSchema: {
           account: aliasSchema.describe('The alias of the connected Gmail account to send from.'),
-          to: recipientSchema.describe('One or more comma-separated recipient email addresses.'),
+          to: recipientSchema
+            .optional()
+            .describe('One or more comma-separated recipient email addresses. Required unless replying.'),
           cc: recipientSchema.optional(),
           bcc: recipientSchema.optional(),
           subject: subjectSchema,
           body: bodySchema,
+          reply_to_message_id: messageIdSchema
+            .optional()
+            .describe(
+              'Optional Gmail message ID (from search/get_email in THIS account) to reply to. The result is placed in ' +
+                'that thread with In-Reply-To/References set. If to is omitted it defaults to the original sender ' +
+                '(Reply-To/From); if subject is omitted it becomes "Re: <original subject>".',
+            ),
+          reply_all: z
+            .boolean()
+            .default(false)
+            .describe('With reply_to_message_id and no to/cc given: also cc the original To/Cc recipients.'),
         },
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
       },
-      async ({ account, to, cc, bcc, subject, body }) => {
+      async ({ account, to, cc, bcc, subject, body, reply_to_message_id, reply_all }) => {
         const record = await resolveAccount(account);
-        log.info('tool_send_email', { account });
+        log.info('tool_send_email', { account, reply: Boolean(reply_to_message_id) });
         try {
-          const sent = await sendMessage(record.refreshToken, { to, cc, bcc, subject, body });
+          const input = await composeInput(record, { to, cc, bcc, subject, body }, reply_to_message_id, reply_all);
+          const sent = await sendMessage(record.refreshToken, input);
           return jsonResult({
             account: record.alias,
             from: record.email,

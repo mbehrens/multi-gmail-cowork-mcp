@@ -224,6 +224,83 @@ export interface ComposeMessageInput {
   bcc?: string;
   subject?: string;
   body: string;
+  /** RFC 5322 Message-ID of the message being replied to (e.g. "<abc@mail.gmail.com>"). */
+  inReplyTo?: string;
+  /** Space-separated Message-IDs for the References header. */
+  references?: string;
+  /** Gmail thread ID to place the message/draft in. */
+  threadId?: string;
+}
+
+export interface ReplyContext {
+  threadId: string;
+  messageIdHeader: string;
+  references: string;
+  subject: string;
+  from: string;
+  replyTo: string;
+  to: string;
+  cc: string;
+}
+
+function extractAddresses(value: string): string[] {
+  return (value.match(/[^\s<>,;"']+@[^\s<>,;"']+\.[^\s<>,;"']+/g) ?? []).map((a) => a.toLowerCase());
+}
+
+/** Reads only the headers needed to reply to a message in its existing thread. */
+export async function getReplyContext(refreshToken: string, messageId: string): Promise<ReplyContext> {
+  const msg = await gmailFetch<GmailMessage>(
+    clientForRefreshToken(refreshToken),
+    `/messages/${encodeMessageId(messageId)}`,
+    { format: 'metadata', metadataHeaders: ['Message-ID', 'References', 'Subject', 'From', 'Reply-To', 'To', 'Cc'] },
+  );
+  const h = msg.payload?.headers;
+  return {
+    threadId: msg.threadId,
+    messageIdHeader: headerLookup(h, 'Message-ID'),
+    references: headerLookup(h, 'References'),
+    subject: headerLookup(h, 'Subject'),
+    from: headerLookup(h, 'From'),
+    replyTo: headerLookup(h, 'Reply-To'),
+    to: headerLookup(h, 'To'),
+    cc: headerLookup(h, 'Cc'),
+  };
+}
+
+/**
+ * Turns a reply context into compose fields: threads the message (threadId,
+ * In-Reply-To, References), prefixes the subject with "Re:" and, unless the
+ * caller gave recipients, addresses the reply to Reply-To/From (and, for
+ * reply_all, the original To/Cc minus the sending account).
+ */
+export function applyReplyContext(
+  input: ComposeMessageInput,
+  ctx: ReplyContext,
+  ownEmail: string,
+  replyAll: boolean,
+): ComposeMessageInput {
+  const own = ownEmail.toLowerCase();
+  const out: ComposeMessageInput = { ...input, threadId: ctx.threadId };
+  if (ctx.messageIdHeader) {
+    out.inReplyTo = ctx.messageIdHeader;
+    out.references = [ctx.references, ctx.messageIdHeader].filter(Boolean).join(' ').trim();
+  }
+  if (!input.subject) {
+    out.subject = /^\s*re\s*:/i.test(ctx.subject) ? ctx.subject : `Re: ${ctx.subject}`.trim();
+  }
+  if (!input.to) {
+    let primary = extractAddresses(ctx.replyTo || ctx.from).filter((a) => a !== own);
+    // Replying to your own sent message: answer the people it went to.
+    if (primary.length === 0) primary = extractAddresses(ctx.to).filter((a) => a !== own);
+    out.to = [...new Set(primary)].join(', ') || undefined;
+    if (replyAll && !input.cc) {
+      const cc = [...extractAddresses(ctx.to), ...extractAddresses(ctx.cc)].filter(
+        (a) => a !== own && !primary.includes(a),
+      );
+      out.cc = [...new Set(cc)].join(', ') || undefined;
+    }
+  }
+  return out;
 }
 
 export interface GmailWriteResult {
@@ -263,6 +340,20 @@ function encodeSubject(subject: string): string {
   return `=?UTF-8?B?${Buffer.from(subject, 'utf8').toString('base64')}?=`;
 }
 
+function threadingHeaders(input: ComposeMessageInput): string[] {
+  const headers: string[] = [];
+  for (const [name, value] of [
+    ['In-Reply-To', input.inReplyTo],
+    ['References', input.references],
+  ] as const) {
+    if (!value) continue;
+    rejectHeaderInjection(value, name);
+    if (value.length > 8_000) throw new Error(`${name} header is too long.`);
+    headers.push(`${name}: ${value}`);
+  }
+  return headers;
+}
+
 function buildRawMessage(input: ComposeMessageInput, requireRecipient: boolean): string {
   if (input.body.length > 100_000) throw new Error('body is too large (maximum 100,000 characters).');
   const to = normalizeRecipients(input.to, 'to', requireRecipient);
@@ -275,6 +366,7 @@ function buildRawMessage(input: ComposeMessageInput, requireRecipient: boolean):
     ...(cc ? [`Cc: ${cc}`] : []),
     ...(bcc ? [`Bcc: ${bcc}`] : []),
     `Subject: ${subject}`,
+    ...threadingHeaders(input),
     'MIME-Version: 1.0',
     'Content-Type: text/plain; charset="UTF-8"',
     'Content-Transfer-Encoding: 8bit',
@@ -287,7 +379,7 @@ export async function sendMessage(refreshToken: string, input: ComposeMessageInp
     clientForRefreshToken(refreshToken),
     '/messages/send',
     {},
-    { method: 'POST', body: { raw: buildRawMessage(input, true) } },
+    { method: 'POST', body: { raw: buildRawMessage(input, true), ...(input.threadId ? { threadId: input.threadId } : {}) } },
   );
 }
 
@@ -296,6 +388,9 @@ export async function createDraft(refreshToken: string, input: ComposeMessageInp
     clientForRefreshToken(refreshToken),
     '/drafts',
     {},
-    { method: 'POST', body: { message: { raw: buildRawMessage(input, false) } } },
+    {
+      method: 'POST',
+      body: { message: { raw: buildRawMessage(input, false), ...(input.threadId ? { threadId: input.threadId } : {}) } },
+    },
   );
 }
